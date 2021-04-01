@@ -40,7 +40,7 @@ func Test_New(t *testing.T) {
 
 	// invalid table name
 	st, err = New(db, "a b", time.Second)
-	equalError(t, sqlite3.ErrError, err)
+	matchingError(t, sqlite3.ErrError, err)
 	assert.Nil(t, st)
 
 	// success
@@ -62,6 +62,7 @@ func Test_New(t *testing.T) {
 		rows, err := sq.Select("*").
 			From(tb).
 			RunWith(db).Query()
+
 		require.NoError(t, err)
 		defer rows.Close()
 
@@ -70,22 +71,24 @@ func Test_New(t *testing.T) {
 
 	// stops auto deletion process
 	require.NoError(t, st.Close())
-	time.Sleep(time.Millisecond * 30)
 
 	mustInsert(t, db, tb, sessionup.Session{
 		ID: "123",
 	})
+
+	// sleep to wait longer than deletion process
 	time.Sleep(time.Millisecond * 30)
 
 	rows, err := sq.Select("*").
 		From(tb).
 		Where("id = ?", 123).
 		RunWith(db).Query()
+
 	require.NoError(t, err)
 	assert.True(t, rows.Next())
-	rows.Close()
+	require.NoError(t, rows.Close())
 
-	db.Close()
+	require.NoError(t, db.Close())
 
 	file, err = os.Create(path)
 	require.NoError(t, err)
@@ -96,7 +99,7 @@ func Test_New(t *testing.T) {
 
 	st, err = New(db, tb, time.Millisecond*10)
 	require.NoError(t, err)
-	db.Close()
+	require.NoError(t, db.Close())
 
 	// error returned in cleanup process
 	assert.Eventually(t, func() bool {
@@ -153,7 +156,7 @@ func (s *Suite) Test_SQLiteStore_Create() {
 		ID: "123",
 	})
 
-	equalError(s.T(), sqlite3.ErrConstraint, s.st.Create(context.Background(), sessionup.Session{
+	matchingError(s.T(), sqlite3.ErrConstraint, s.st.Create(context.Background(), sessionup.Session{
 		ID: "123",
 	}))
 
@@ -171,7 +174,7 @@ func (s *Suite) Test_SQLiteStore_Create() {
 
 	s.Require().NoError(err)
 	s.Assert().True(rows.Next())
-	rows.Close()
+	s.Require().NoError(rows.Close())
 }
 
 func (s *Suite) Test_SQLiteStore_FetchByID() {
@@ -191,6 +194,7 @@ func (s *Suite) Test_SQLiteStore_FetchByID() {
 		}).
 		RunWith(s.db).
 		Exec()
+
 	s.Require().NoError(err)
 
 	s2, ok, err := s.st.FetchByID(context.Background(), "2")
@@ -227,6 +231,7 @@ func (s *Suite) Test_SQLiteStore_FetchByUserKey() {
 		}).
 		RunWith(s.db).
 		Exec()
+
 	s.Require().NoError(err)
 
 	ss, err = s.st.FetchByUserKey(context.Background(), "2")
@@ -260,9 +265,10 @@ func (s *Suite) Test_SQLiteStore_DeleteByID() {
 		From(s.table).
 		Where("id = ?", "123").
 		RunWith(s.db).Query()
-	require.NoError(s.T(), err)
-	assert.True(s.T(), rows.Next())
-	rows.Close()
+
+	s.Require().NoError(err)
+	s.Require().True(rows.Next())
+	s.Require().NoError(rows.Close())
 
 	s.Assert().NoError(s.st.DeleteByID(context.Background(), "123"))
 
@@ -270,9 +276,10 @@ func (s *Suite) Test_SQLiteStore_DeleteByID() {
 		From(s.table).
 		Where("id = ?", "123").
 		RunWith(s.db).Query()
-	require.NoError(s.T(), err)
-	assert.False(s.T(), rows.Next())
-	rows.Close()
+
+	s.Require().NoError(err)
+	s.Require().False(rows.Next())
+	s.Require().NoError(rows.Close())
 }
 
 func (s *Suite) Test_SQLiteStore_DeleteByUserKey() {
@@ -288,9 +295,10 @@ func (s *Suite) Test_SQLiteStore_DeleteByUserKey() {
 		From(s.table).
 		Where("user_key = ?", "123").
 		RunWith(s.db).Query()
-	require.NoError(s.T(), err)
-	assert.True(s.T(), rows.Next())
-	rows.Close()
+
+	s.Require().NoError(err)
+	s.Require().True(rows.Next())
+	s.Require().NoError(rows.Close())
 
 	s.Assert().NoError(s.st.DeleteByUserKey(context.Background(), "123"))
 
@@ -298,24 +306,25 @@ func (s *Suite) Test_SQLiteStore_DeleteByUserKey() {
 		From(s.table).
 		Where("user_key = ?", "123").
 		RunWith(s.db).Query()
-	require.NoError(s.T(), err)
-	assert.False(s.T(), rows.Next())
-	rows.Close()
+
+	s.Require().NoError(err)
+	s.Require().False(rows.Next())
+	s.Require().NoError(rows.Close())
 }
 
-func equalError(t *testing.T, en sqlite3.ErrNo, err error) {
+func matchingError(t *testing.T, en sqlite3.ErrNo, err error) {
 	nerr, ok := err.(sqlite3.Error)
 	require.True(t, ok)
 	assert.Equal(t, en, nerr.Code)
 }
 
-func mustInsert(t *testing.T, db *sql.DB, table string, s sessionup.Session) {
+func mustInsert(t *testing.T, db *sql.DB, tb string, s sessionup.Session) {
 	t.Helper()
 
 	data, err := json.Marshal(newRecord(s))
 	require.NoError(t, err)
 
-	_, err = sq.Insert(table).
+	_, err = sq.Insert(tb).
 		SetMap(map[string]interface{}{
 			"id":         s.ID,
 			"user_key":   s.UserKey,
@@ -324,5 +333,6 @@ func mustInsert(t *testing.T, db *sql.DB, table string, s sessionup.Session) {
 		}).
 		RunWith(db).
 		Exec()
+
 	require.NoError(t, err)
 }

@@ -47,7 +47,7 @@ func New(db *sql.DB, table string, cleanupInterval time.Duration) (*SQLiteStore,
 
 	if _, err := db.Exec(fmt.Sprintf(`
 	CREATE TABLE IF NOT EXISTS %s (
-		id VARCHAR(255) PRIMARY KEY,
+		id VARCHAR(255) PRIMARY KEY NOT NULL,
 		user_key VARCHAR(255) NOT NULL,
 		expires_at DATETIME NOT NULL,
 		data BLOB NOT NULL
@@ -74,7 +74,7 @@ func New(db *sql.DB, table string, cleanupInterval time.Duration) (*SQLiteStore,
 				case <-ctx.Done():
 					return
 				case <-t.C:
-					if err := st.cleanup(ctx); err != nil && err != context.Canceled {
+					if err := st.cleanup(ctx); err != nil && !errors.Is(err, context.Canceled) {
 						st.errCh <- err
 					}
 				}
