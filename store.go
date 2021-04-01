@@ -201,7 +201,7 @@ func (st *SQLiteStore) DeleteByUserKey(ctx context.Context, key string, expIDs .
 }
 
 // CleanupErr returns a channel that should be used to read and handle errors
-// that occured during cleanup process. Whenever the cleanup service is active,
+// that occurred during cleanup process. Whenever the cleanup service is active,
 // errors from this channel will have to be drained, otherwise cleanup won't be able
 // to continue its process.
 func (st SQLiteStore) CleanupErr() <-chan error {
