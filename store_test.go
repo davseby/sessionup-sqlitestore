@@ -45,17 +45,21 @@ func Test_New(t *testing.T) {
 
 	// success
 	tb := "test"
-	st, err = New(db, tb, time.Millisecond*5)
+	ses := sessionup.Session{
+		ID: "123",
+	}
+
+	st, err = New(db, tb, time.Millisecond*5, OnDeletion(func(_ context.Context, dses sessionup.Session) {
+		assert.Equal(t, ses, dses)
+	}), ErrorChannelBuffer(5))
 	require.NoError(t, err)
 	assert.NotNil(t, st.db)
-	assert.NotNil(t, st.cancel)
-	assert.NotNil(t, st.errCh)
+	assert.NotNil(t, st.lifetime.cancel)
+	assert.NotNil(t, st.cleanup.errCh)
+	assert.NotNil(t, st.deletionFn)
 	assert.Equal(t, st.table, tb)
-	assert.Equal(t, st.cleanupInterval, time.Millisecond*5)
 
-	mustInsert(t, db, tb, sessionup.Session{
-		ID: "123",
-	})
+	mustInsert(t, db, tb, ses)
 
 	// auto deletion works
 	assert.Eventually(t, func() bool {
@@ -67,14 +71,12 @@ func Test_New(t *testing.T) {
 		defer rows.Close()
 
 		return !rows.Next()
-	}, time.Second, time.Millisecond*5)
+	}, 5*time.Second, time.Millisecond*5)
 
 	// stops auto deletion process
 	require.NoError(t, st.Close())
 
-	mustInsert(t, db, tb, sessionup.Session{
-		ID: "123",
-	})
+	mustInsert(t, db, tb, ses)
 
 	// sleep to wait longer than deletion process
 	time.Sleep(time.Millisecond * 30)
@@ -182,7 +184,7 @@ func (s *Suite) Test_SQLiteStore_FetchByID() {
 	s1, ok, err := s.st.FetchByID(context.Background(), "1")
 	s.Assert().Empty(s1)
 	s.Assert().False(ok)
-	s.Assert().Equal("sql: no rows in result set", err.Error())
+	s.Assert().NoError(err)
 
 	// malformed data
 	_, err = sq.Insert(s.table).
@@ -257,9 +259,15 @@ func (s *Suite) Test_SQLiteStore_DeleteByID() {
 	s.Assert().NoError(s.st.DeleteByID(context.Background(), "1"))
 
 	// success
-	mustInsert(s.T(), s.db, s.table, sessionup.Session{
+	ses := sessionup.Session{
 		ID: "123",
-	})
+	}
+
+	s.st.deletionFn = func(_ context.Context, dses sessionup.Session) {
+		s.Require().Equal(ses, dses)
+	}
+
+	mustInsert(s.T(), s.db, s.table, ses)
 
 	rows, err := sq.Select("*").
 		From(s.table).
@@ -287,9 +295,15 @@ func (s *Suite) Test_SQLiteStore_DeleteByUserKey() {
 	s.Assert().NoError(s.st.DeleteByUserKey(context.Background(), "1"))
 
 	// success
-	mustInsert(s.T(), s.db, s.table, sessionup.Session{
+	ses := sessionup.Session{
 		UserKey: "123",
-	})
+	}
+
+	s.st.deletionFn = func(_ context.Context, dses sessionup.Session) {
+		s.Require().Equal(ses, dses)
+	}
+
+	mustInsert(s.T(), s.db, s.table, ses)
 
 	rows, err := sq.Select("*").
 		From(s.table).
