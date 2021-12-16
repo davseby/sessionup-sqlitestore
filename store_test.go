@@ -4,8 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,21 +17,12 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/stretchr/testify/suite"
 	"github.com/swithek/sessionup"
 )
 
-func Test_New(t *testing.T) {
-	// invalid table
-	st, err := New(&sql.DB{}, "", time.Second)
-	require.Equal(t, ErrInvalidTable, err)
-	assert.Nil(t, st)
+const _table = "sessions"
 
-	// invalid cleanup interval
-	st, err = New(&sql.DB{}, "ab", time.Second*-1)
-	require.Equal(t, ErrInvalidInterval, err)
-	assert.Nil(t, st)
-
+func prepDB(t *testing.T) *sql.DB {
 	path := filepath.Join(t.TempDir(), "sqlite.db")
 
 	file, err := os.Create(path)
@@ -38,315 +32,441 @@ func Test_New(t *testing.T) {
 	db, err := sql.Open("sqlite3", path)
 	require.NoError(t, err)
 
-	// invalid table name
-	st, err = New(db, "a b", time.Second)
-	matchingError(t, sqlite3.ErrError, err)
-	assert.Nil(t, st)
-
-	// success
-	tb := "test"
-	ses := sessionup.Session{
-		ID: "123",
-	}
-
-	st, err = New(db, tb, time.Millisecond*5, OnDeletion(func(_ context.Context, dses sessionup.Session) {
-		assert.Equal(t, ses, dses)
-	}), ErrorChannelBuffer(5))
-	require.NoError(t, err)
-	assert.NotNil(t, st.db)
-	assert.NotNil(t, st.lifetime.cancel)
-	assert.NotNil(t, st.cleanup.errCh)
-	assert.NotNil(t, st.deletionFn)
-	assert.Equal(t, st.table, tb)
-
-	mustInsert(t, db, tb, ses)
-
-	// auto deletion works
-	assert.Eventually(t, func() bool {
-		rows, err := sq.Select("*").
-			From(tb).
-			RunWith(db).Query()
-
-		require.NoError(t, err)
-		defer rows.Close()
-
-		return !rows.Next()
-	}, 5*time.Second, time.Millisecond*5)
-
-	// stops auto deletion process
-	require.NoError(t, st.Close())
-
-	mustInsert(t, db, tb, ses)
-
-	// sleep to wait longer than deletion process
-	time.Sleep(time.Millisecond * 30)
-
-	rows, err := sq.Select("*").
-		From(tb).
-		Where("id = ?", 123).
-		RunWith(db).Query()
+	_, err = db.Exec(fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s (
+			id TEXT PRIMARY KEY,
+			user_key TEXT NOT NULL,
+			expires_at DATETIME NOT NULL,
+			created_at DATETIME NOT NULL,
+			ip TEXT,
+			agent_os TEXT,
+			agent_browser TEXT,
+			meta BLOB
+		)`, _table))
 
 	require.NoError(t, err)
-	assert.True(t, rows.Next())
-	require.NoError(t, rows.Close())
+	require.NoError(t, db.Ping())
 
+	return db
+}
+
+func Test_New(t *testing.T) {
+	// Closed DB returns an error.
+	db := prepDB(t)
 	require.NoError(t, db.Close())
 
-	file, err = os.Create(path)
-	require.NoError(t, err)
-	require.NoError(t, file.Close())
+	st, err := New(db, _table)
+	assert.Empty(t, st)
+	assert.Error(t, err)
 
-	db, err = sql.Open("sqlite3", path)
+	// Success.
+	st, err = New(prepDB(t), _table)
 	require.NoError(t, err)
+	assert.NotNil(t, st.deletion.fns)
+}
 
-	st, err = New(db, tb, time.Millisecond*10)
-	require.NoError(t, err)
+func Test_SQLiteStore_Cleanup(t *testing.T) {
+	// Closed DB returns an error.
+	db := prepDB(t)
 	require.NoError(t, db.Close())
 
-	// error returned in cleanup process
-	assert.Eventually(t, func() bool {
-		require.Error(t, <-st.CleanupErr())
-		return true
-	}, time.Second, time.Millisecond*5)
-}
-
-func Test_Store(t *testing.T) {
-	suite.Run(t, &Suite{})
-}
-
-type Suite struct {
-	suite.Suite
-
-	path  string
-	table string
-
-	st *SQLiteStore
-	db *sql.DB
-}
-
-func (s *Suite) SetupSuite() {
-	s.path = filepath.Join(s.T().TempDir(), "sqlite.db")
-	s.table = "test"
-
-	file, err := os.Create(s.path)
-	s.Require().NoError(err)
-	s.Require().NoError(file.Close())
-
-	db, err := sql.Open("sqlite3", s.path)
-	s.Require().NoError(err)
-
-	s.db = db
-	s.st, err = New(db, s.table, 0)
-	s.Require().NoError(err)
-}
-
-func (s *Suite) TearDownSuite() {
-	s.Require().NoError(s.db.Close())
-}
-
-func (s *Suite) TearDownTest() {
-	_, err := sq.Delete(s.table).
-		RunWith(s.db).
-		Exec()
-
-	s.Require().NoError(err)
-}
-
-func (s *Suite) Test_SQLiteStore_Create() {
-	// duplicate error
-	mustInsert(s.T(), s.db, s.table, sessionup.Session{
-		ID: "123",
-	})
-
-	matchingError(s.T(), sqlite3.ErrConstraint, s.st.Create(context.Background(), sessionup.Session{
-		ID: "123",
-	}))
-
-	// success
-	s1 := sessionup.Session{
-		ID: "555",
+	st := &SQLiteStore{
+		db:    db,
+		table: _table,
 	}
 
-	s.Require().NoError(s.st.Create(context.Background(), s1))
+	assert.Error(t, st.Cleanup(context.Background(), 1))
 
-	rows, err := sq.Select("*").
-		From(s.table).
-		Where("id = ?", s1.ID).
-		RunWith(s.db).Query()
+	st.db = prepDB(t)
 
-	s.Require().NoError(err)
-	s.Assert().True(rows.Next())
-	s.Require().NoError(rows.Close())
-}
+	// Empty db should not return an error.
+	assert.NoError(t, st.removeExpiredSessions(context.Background()))
 
-func (s *Suite) Test_SQLiteStore_FetchByID() {
-	// not found
-	s1, ok, err := s.st.FetchByID(context.Background(), "1")
-	s.Assert().Empty(s1)
-	s.Assert().False(ok)
-	s.Assert().NoError(err)
+	// Invalid interval.
+	assert.Equal(t, ErrInvalidInterval, st.Cleanup(context.Background(), 0))
 
-	// malformed data
-	_, err = sq.Insert(s.table).
-		SetMap(map[string]interface{}{
-			"id":         "2",
-			"user_key":   "abc",
-			"expires_at": time.Now().Add(time.Minute),
-			"data":       "{",
-		}).
-		RunWith(s.db).
-		Exec()
-
-	s.Require().NoError(err)
-
-	s2, ok, err := s.st.FetchByID(context.Background(), "2")
-	s.Assert().Empty(s2)
-	s.Assert().False(ok)
-	s.Assert().Equal("unexpected end of JSON input", err.Error())
-
-	// success
-	res := sessionup.Session{
-		ID: "3",
-	}
-
-	mustInsert(s.T(), s.db, s.table, res)
-
-	s3, ok, err := s.st.FetchByID(context.Background(), "3")
-	s.Assert().Equal(res, s3)
-	s.Assert().True(ok)
-	s.Assert().NoError(err)
-}
-
-func (s *Suite) Test_SQLiteStore_FetchByUserKey() {
-	// not found
-	ss, err := s.st.FetchByUserKey(context.Background(), "1")
-	s.Assert().Empty(ss)
-	s.Assert().NoError(err)
-
-	// malformed data
-	_, err = sq.Insert(s.table).
-		SetMap(map[string]interface{}{
-			"id":         "abc",
-			"user_key":   "2",
-			"expires_at": time.Now().Add(time.Minute),
-			"data":       "{",
-		}).
-		RunWith(s.db).
-		Exec()
-
-	s.Require().NoError(err)
-
-	ss, err = s.st.FetchByUserKey(context.Background(), "2")
-	s.Assert().Empty(ss)
-	s.Assert().Equal("unexpected end of JSON input", err.Error())
-
-	// success
-	res := []sessionup.Session{
+	// Success.
+	tstamp := time.Now().UTC()
+	sessions := []sessionup.Session{
 		{
-			UserKey: "3",
+			ID:        "123",
+			ExpiresAt: tstamp.Add(time.Hour),
+		},
+		{
+			ID:        "124",
+			ExpiresAt: tstamp.Add(-100 * time.Hour),
+		},
+		{
+			ID:        "125",
+			ExpiresAt: tstamp.Add(time.Hour),
 		},
 	}
 
-	mustInsert(s.T(), s.db, s.table, res[0])
+	for _, session := range sessions {
+		mustInsert(t, st.db, session)
+	}
 
-	ss, err = s.st.FetchByUserKey(context.Background(), "3")
-	s.Assert().Equal(res, ss)
-	s.Assert().NoError(err)
+	ch := make(chan struct{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var calls int
+	st.deletion.fns = map[uint64]func(context.Context, sessionup.Session){
+		0: func(_ context.Context, session sessionup.Session) {
+			assert.Equal(t, sessions[1], session)
+			close(ch)
+			cancel()
+			calls++
+		},
+	}
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := st.Cleanup(ctx, time.Hour)
+		assert.Equal(t, ctx.Err(), err)
+	}()
+
+	<-ch
+	wg.Wait()
+
+	assert.Equal(t, 1, calls)
 }
 
-func (s *Suite) Test_SQLiteStore_DeleteByID() {
-	// no records
-	s.Assert().NoError(s.st.DeleteByID(context.Background(), "1"))
+func Test_SQLiteStore_OnDeletion(t *testing.T) {
+	st := &SQLiteStore{}
+	st.deletion.fns = make(map[uint64]func(context.Context, sessionup.Session))
 
-	// success
-	ses := sessionup.Session{
+	var called bool
+	unsub := st.OnDeletion(func(_ context.Context, _ sessionup.Session) {
+		called = true
+	})
+
+	assert.Len(t, st.deletion.fns, 1)
+	st.deletion.fns[0](context.Background(), sessionup.Session{})
+
+	unsub()
+	assert.Len(t, st.deletion.fns, 0)
+
+	assert.True(t, called)
+}
+
+func Test_SQLiteStore_Create(t *testing.T) {
+	st := &SQLiteStore{
+		db:    prepDB(t),
+		table: _table,
+	}
+
+	// Duplicate primary key.
+	mustInsert(t, st.db, sessionup.Session{
 		ID: "123",
+	})
+
+	assertEqualError(t,
+		sqlite3.ErrConstraint,
+		st.Create(context.Background(), sessionup.Session{
+			ID: "123",
+		}),
+	)
+
+	session := sessionup.Session{
+		ID: "555",
+		Meta: map[string]string{
+			"test": "test",
+		},
 	}
 
-	s.st.deletionFn = func(_ context.Context, dses sessionup.Session) {
-		s.Require().Equal(ses, dses)
-	}
+	// Successfully created new session.
+	require.NoError(t, st.Create(context.Background(), session))
 
-	mustInsert(s.T(), s.db, s.table, ses)
+	sessions := mustSelect(t, st.db, func(b sq.SelectBuilder) sq.SelectBuilder {
+		return b.Where(sq.Eq{"id": session.ID})
+	})
 
-	rows, err := sq.Select("*").
-		From(s.table).
-		Where("id = ?", "123").
-		RunWith(s.db).Query()
-
-	s.Require().NoError(err)
-	s.Require().True(rows.Next())
-	s.Require().NoError(rows.Close())
-
-	s.Assert().NoError(s.st.DeleteByID(context.Background(), "123"))
-
-	rows, err = sq.Select("*").
-		From(s.table).
-		Where("id = ?", "123").
-		RunWith(s.db).Query()
-
-	s.Require().NoError(err)
-	s.Require().False(rows.Next())
-	s.Require().NoError(rows.Close())
+	require.Len(t, sessions, 1)
+	assert.Equal(t, session, sessions[0])
 }
 
-func (s *Suite) Test_SQLiteStore_DeleteByUserKey() {
-	// no records
-	s.Assert().NoError(s.st.DeleteByUserKey(context.Background(), "1"))
-
-	// success
-	ses := sessionup.Session{
-		UserKey: "123",
+func Test_SQLiteStore_FetchByID(t *testing.T) {
+	st := &SQLiteStore{
+		db:    prepDB(t),
+		table: _table,
 	}
 
-	s.st.deletionFn = func(_ context.Context, dses sessionup.Session) {
-		s.Require().Equal(ses, dses)
+	// Not found.
+	session, ok, err := st.FetchByID(context.Background(), "123")
+	assert.Empty(t, session)
+	assert.False(t, ok)
+	assert.NoError(t, err)
+
+	// Not found as session is expired.
+	expired := sessionup.Session{
+		ID:        "126",
+		ExpiresAt: time.Now().Add(-time.Hour).UTC(),
 	}
 
-	mustInsert(s.T(), s.db, s.table, ses)
+	mustInsert(t, st.db, expired)
 
-	rows, err := sq.Select("*").
-		From(s.table).
-		Where("user_key = ?", "123").
-		RunWith(s.db).Query()
+	session, ok, err = st.FetchByID(context.Background(), expired.ID)
+	assert.Empty(t, session)
+	assert.False(t, ok)
+	assert.NoError(t, err)
 
-	s.Require().NoError(err)
-	s.Require().True(rows.Next())
-	s.Require().NoError(rows.Close())
+	// Successfully fetched by ID.
+	expected := sessionup.Session{
+		ID:        "123",
+		ExpiresAt: time.Now().Add(time.Hour).UTC(),
+	}
 
-	s.Assert().NoError(s.st.DeleteByUserKey(context.Background(), "123"))
+	mustInsert(t, st.db, expected)
 
-	rows, err = sq.Select("*").
-		From(s.table).
-		Where("user_key = ?", "123").
-		RunWith(s.db).Query()
-
-	s.Require().NoError(err)
-	s.Require().False(rows.Next())
-	s.Require().NoError(rows.Close())
+	session, ok, err = st.FetchByID(context.Background(), expected.ID)
+	assert.Equal(t, expected, session)
+	assert.True(t, ok)
+	assert.NoError(t, err)
 }
 
-func matchingError(t *testing.T, en sqlite3.ErrNo, err error) {
+func Test_SQLiteStore_FetchByUserKey(t *testing.T) {
+	st := &SQLiteStore{
+		db:    prepDB(t),
+		table: _table,
+	}
+
+	// Not found.
+	sessions, err := st.FetchByUserKey(context.Background(), "123")
+	assert.Empty(t, sessions)
+	assert.NoError(t, err)
+
+	// Successfully fetched by UserKey.
+	mocked := []sessionup.Session{
+		{
+			ID:        "1",
+			UserKey:   "123",
+			ExpiresAt: time.Now().Add(time.Hour).UTC(),
+		},
+		{
+			ID:        "2",
+			UserKey:   "123",
+			ExpiresAt: time.Now().Add(-time.Hour).UTC(),
+		},
+		{
+			ID:        "3",
+			UserKey:   "123",
+			ExpiresAt: time.Now().Add(time.Hour).UTC(),
+		},
+		{
+			ID:        "4",
+			UserKey:   "124",
+			ExpiresAt: time.Now().Add(time.Hour).UTC(),
+		},
+	}
+
+	for _, session := range mocked {
+		mustInsert(t, st.db, session)
+	}
+
+	sessions, err = st.FetchByUserKey(context.Background(), "123")
+	assert.Equal(t, append(mocked[:1], mocked[2]), sessions)
+	assert.NoError(t, err)
+}
+
+func Test_SQLiteStore_DeleteByID(t *testing.T) {
+	st := &SQLiteStore{
+		db:    prepDB(t),
+		table: _table,
+	}
+
+	// Not found.
+	assert.NoError(t, st.DeleteByID(context.Background(), "123"))
+
+	// Successfully deleted by ID.
+	mocked := []sessionup.Session{
+		{
+			ID:        "1",
+			UserKey:   "123",
+			ExpiresAt: time.Now().Add(time.Hour).UTC(),
+		},
+		{
+			ID:        "2",
+			UserKey:   "123",
+			ExpiresAt: time.Now().Add(-time.Hour).UTC(),
+		},
+	}
+
+	for _, session := range mocked {
+		mustInsert(t, st.db, session)
+	}
+
+	ch := make(chan struct{})
+	st.deletion.fns = map[uint64]func(context.Context, sessionup.Session){
+		0: func(_ context.Context, session sessionup.Session) {
+			assert.Equal(t, mocked[1], session)
+			close(ch)
+		},
+	}
+
+	assert.NoError(t, st.DeleteByID(context.Background(), "2"))
+	<-ch
+}
+
+func Test_SQLiteStore_DeleteByUserKey(t *testing.T) {
+	st := &SQLiteStore{
+		db:    prepDB(t),
+		table: _table,
+	}
+
+	// Not found.
+	assert.NoError(t, st.DeleteByUserKey(context.Background(), "123"))
+
+	// Successfully deleted by UserKey.
+	mocked := []sessionup.Session{
+		{
+			ID:        "1",
+			UserKey:   "124",
+			ExpiresAt: time.Now().Add(-time.Hour).UTC(),
+		},
+		{
+			ID:        "2",
+			UserKey:   "123",
+			ExpiresAt: time.Now().Add(time.Hour).UTC(),
+		},
+		{
+			ID:        "3",
+			UserKey:   "124",
+			ExpiresAt: time.Now().Add(-time.Hour).UTC(),
+		},
+		{
+			ID:        "4",
+			UserKey:   "123",
+			ExpiresAt: time.Now().Add(-time.Hour).UTC(),
+		},
+		{
+			ID:        "5",
+			UserKey:   "124",
+			ExpiresAt: time.Now().Add(-time.Hour).UTC(),
+		},
+	}
+
+	for _, session := range mocked {
+		mustInsert(t, st.db, session)
+	}
+
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		visited = make(map[string]struct{})
+	)
+
+	wg.Add(2)
+	st.deletion.fns = map[uint64]func(context.Context, sessionup.Session){
+		0: func(_ context.Context, session sessionup.Session) {
+			mu.Lock()
+			defer mu.Unlock()
+
+			visited[session.ID] = struct{}{}
+			for _, expected := range mocked {
+				if expected.ID == session.ID {
+					assert.Equal(t, expected, session)
+				}
+			}
+
+			wg.Done()
+		},
+	}
+
+	assert.NoError(t, st.DeleteByUserKey(context.Background(), "124", "5"))
+	wg.Wait()
+
+	_, ok := visited["1"]
+	assert.True(t, ok)
+
+	_, ok = visited["3"]
+	assert.True(t, ok)
+}
+
+func assertEqualError(t *testing.T, en sqlite3.ErrNo, err error) {
 	nerr, ok := err.(sqlite3.Error)
 	require.True(t, ok)
 	assert.Equal(t, en, nerr.Code)
 }
 
-func mustInsert(t *testing.T, db *sql.DB, tb string, s sessionup.Session) {
+func mustInsert(t *testing.T, db *sql.DB, session sessionup.Session) {
 	t.Helper()
 
-	data, err := json.Marshal(newRecord(s))
+	data, err := json.Marshal(session.Meta)
 	require.NoError(t, err)
 
-	_, err = sq.Insert(tb).
+	_, err = sq.Insert(_table).
 		SetMap(map[string]interface{}{
-			"id":         s.ID,
-			"user_key":   s.UserKey,
-			"expires_at": s.ExpiresAt,
-			"data":       data,
+			"id":            session.ID,
+			"user_key":      session.UserKey,
+			"expires_at":    session.ExpiresAt,
+			"created_at":    session.CreatedAt,
+			"ip":            session.IP.String(),
+			"agent_os":      session.Agent.OS,
+			"agent_browser": session.Agent.Browser,
+			"meta":          data,
 		}).
 		RunWith(db).
 		Exec()
 
 	require.NoError(t, err)
+}
+
+func mustSelect(
+	t *testing.T,
+	db *sql.DB,
+	dec func(b sq.SelectBuilder) sq.SelectBuilder,
+) []sessionup.Session {
+
+	t.Helper()
+
+	rows, err := dec(sq.
+		Select(
+			"id",
+			"user_key",
+			"expires_at",
+			"created_at",
+			"ip",
+			"agent_os",
+			"agent_browser",
+			"meta",
+		).
+		From(_table).
+		RunWith(db),
+	).Query()
+
+	require.NoError(t, err)
+	defer rows.Close() // nolint: errcheck // this error is meaningless.
+
+	var sessions []sessionup.Session
+	for rows.Next() {
+		var (
+			session sessionup.Session
+			ip      string
+			data    []byte
+		)
+
+		require.NoError(t, rows.Scan(
+			&session.ID,
+			&session.UserKey,
+			&session.ExpiresAt,
+			&session.CreatedAt,
+			&ip,
+			&session.Agent.OS,
+			&session.Agent.Browser,
+			&data,
+		))
+
+		if len(data) > 0 {
+			require.NoError(t, json.Unmarshal(data, &session.Meta))
+		}
+
+		session.IP = net.ParseIP(ip)
+		sessions = append(sessions, session)
+	}
+
+	return sessions
 }
