@@ -28,7 +28,7 @@ type SQLiteStore struct {
 	table string
 
 	deletion struct {
-		sync.RWMutex
+		mu sync.Mutex
 
 		nextID uint64
 		fns    map[uint64]func(context.Context, sessionup.Session)
@@ -62,6 +62,57 @@ func New(db *sql.DB, table string) (*SQLiteStore, error) {
 	return st, nil
 }
 
+// NewWithCleanup creates and returns a fresh instance of SQLiteStore and
+// additionally spins up cleanup go routine. To manage new go routine
+// a cleanup errors channel and cleanup close delegate function is returned.
+func NewWithCleanup(
+	db *sql.DB,
+	table string,
+	dur time.Duration,
+) (*SQLiteStore, <-chan error, func(), error) {
+
+	if dur <= 0 {
+		return nil, nil, nil, ErrInvalidInterval
+	}
+
+	st, err := New(db, table)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(context.Background())
+
+	errCh := make(chan error)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			err := st.Cleanup(ctx, dur)
+			if errors.Is(err, ctx.Err()) {
+				return
+			}
+
+			select {
+			case errCh <- err:
+			default:
+				// slow receiver.
+			}
+		}
+	}()
+
+	return st, errCh, func() {
+		cancel()
+		wg.Wait()
+
+		// drain errors channel.
+		close(errCh)
+		for range errCh {
+		}
+	}, nil
+}
+
 // Cleanup periodically removes all expired records from the store by their
 // expiration time.
 // Duration specifies how often cleanup should be ran.
@@ -71,7 +122,7 @@ func (st *SQLiteStore) Cleanup(ctx context.Context, dur time.Duration) error {
 		return ErrInvalidInterval
 	}
 
-	tc := time.NewTimer(0)
+	tc := time.NewTimer(dur)
 	defer tc.Stop()
 
 	for {
@@ -91,17 +142,17 @@ func (st *SQLiteStore) Cleanup(ctx context.Context, dur time.Duration) error {
 // OnDeletion sets provided handler to be executed whenever a session is deleted.
 // Unsubscribe method is returned, that allows to unset the handler.
 func (st *SQLiteStore) OnDeletion(fn func(context.Context, sessionup.Session)) func() {
-	st.deletion.Lock()
-	defer st.deletion.Unlock()
+	st.deletion.mu.Lock()
+	defer st.deletion.mu.Unlock()
 
 	id := st.deletion.nextID
 	st.deletion.nextID++
 	st.deletion.fns[id] = fn
 
 	return func() {
-		st.deletion.Lock()
+		st.deletion.mu.Lock()
 		delete(st.deletion.fns, id)
-		st.deletion.Unlock()
+		st.deletion.mu.Unlock()
 	}
 }
 
@@ -146,7 +197,6 @@ func (st *SQLiteStore) FetchByID(ctx context.Context, id string) (sessionup.Sess
 		return b.Where(sq.Eq{"id": id})
 	})
 	if err != nil {
-		// unlikely to happen.
 		return sessionup.Session{}, false, err
 	}
 
@@ -165,7 +215,6 @@ func (st *SQLiteStore) FetchByUserKey(ctx context.Context, key string) ([]sessio
 		return b.Where(sq.Eq{"user_key": key})
 	})
 	if err != nil {
-		// unlikely to happen.
 		return nil, err
 	}
 
@@ -187,14 +236,17 @@ func (st *SQLiteStore) FetchByUserKey(ctx context.Context, key string) ([]sessio
 // If session is found OnDeletion handlers will be executed.
 // If session is not found, this function will be no-op.
 func (st *SQLiteStore) DeleteByID(ctx context.Context, id string) error {
-	st.deletion.Lock()
-	defer st.deletion.Unlock()
+	tx, err := st.beginImmediateTransaction(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() // nolint: errcheck // this error is meaningless.
 
-	sessions, err := st.selectSessions(ctx, st.db, func(b sq.SelectBuilder) sq.SelectBuilder {
+	sessions, err := st.selectSessions(ctx, tx, func(b sq.SelectBuilder) sq.SelectBuilder {
 		return b.Where(sq.Eq{"id": id})
 	})
 	if err != nil {
-		// unlikely to happen
+		// unlikely to happen.
 		return err
 	}
 
@@ -204,10 +256,15 @@ func (st *SQLiteStore) DeleteByID(ctx context.Context, id string) error {
 
 	_, err = sq.Delete(st.table).
 		Where("id = ?", id).
-		RunWith(st.db).
+		RunWith(tx).
 		ExecContext(ctx)
 	if err != nil {
 		// unlikely to happen
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		// unlikely to happen.
 		return err
 	}
 
@@ -223,10 +280,13 @@ func (st *SQLiteStore) DeleteByID(ctx context.Context, id string) error {
 // For each deleted session all OnDeletion handlers will be executed.
 // If none are found, this function will no-op.
 func (st *SQLiteStore) DeleteByUserKey(ctx context.Context, key string, expIDs ...string) error {
-	st.deletion.Lock()
-	defer st.deletion.Unlock()
+	tx, err := st.beginImmediateTransaction(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() // nolint: errcheck // this error is meaningless.
 
-	sessions, err := st.selectSessions(ctx, st.db, func(b sq.SelectBuilder) sq.SelectBuilder {
+	sessions, err := st.selectSessions(ctx, tx, func(b sq.SelectBuilder) sq.SelectBuilder {
 		return b.Where(sq.And{
 			sq.Eq{"user_key": key},
 			sq.NotEq{"id": expIDs},
@@ -244,10 +304,15 @@ func (st *SQLiteStore) DeleteByUserKey(ctx context.Context, key string, expIDs .
 
 	_, err = sq.Delete(st.table).
 		Where(sq.Eq{"id": ids}).
-		RunWith(st.db).
+		RunWith(tx).
 		ExecContext(ctx)
 	if err != nil {
 		// unlikely to happen
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		// unlikely to happen.
 		return err
 	}
 
@@ -324,15 +389,19 @@ func (st *SQLiteStore) selectSessions(
 }
 
 func (st *SQLiteStore) removeExpiredSessions(ctx context.Context) error {
-	st.deletion.Lock()
-	defer st.deletion.Unlock()
+	tx, err := st.beginImmediateTransaction(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() // nolint: errcheck // this error is meaningless.
 
-	sessions, err := st.selectSessions(ctx, st.db, func(b sq.SelectBuilder) sq.SelectBuilder {
+	sessions, err := st.selectSessions(ctx, tx, func(b sq.SelectBuilder) sq.SelectBuilder {
 		return b.Where(sq.LtOrEq{
 			"expires_at": time.Now().UTC(),
 		})
 	})
 	if err != nil {
+		// unlikely to happen.
 		return err
 	}
 
@@ -347,18 +416,38 @@ func (st *SQLiteStore) removeExpiredSessions(ctx context.Context) error {
 
 	_, err = sq.Delete(st.table).
 		Where(sq.Eq{"id": ids}).
-		RunWith(st.db).
+		RunWith(tx).
 		ExecContext(ctx)
 	if err != nil {
 		// unlikely to happen.
 		return err
 	}
 
+	if err := tx.Commit(); err != nil {
+		// unlikely to happen.
+		return err
+	}
+
 	for _, session := range sessions {
 		for _, fn := range st.deletion.fns {
-			fn(ctx, session)
+			go fn(ctx, session)
 		}
 	}
 
 	return nil
+}
+
+func (st *SQLiteStore) beginImmediateTransaction(ctx context.Context) (*sql.Tx, error) {
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = tx.Exec("ROLLBACK; BEGIN IMMEDIATE")
+	if err != nil {
+		// unlikely to happen.
+		return nil, err
+	}
+
+	return tx, nil
 }

@@ -65,6 +65,51 @@ func Test_New(t *testing.T) {
 	assert.NotNil(t, st.deletion.fns)
 }
 
+func Test_NewWithCleanup(t *testing.T) {
+	// Closed DB returns an error.
+	db := prepDB(t)
+	require.NoError(t, db.Close())
+
+	st, errCh, cancel, err := NewWithCleanup(db, _table, time.Second)
+	assert.Empty(t, st)
+	assert.Nil(t, errCh)
+	assert.Nil(t, cancel)
+	assert.Error(t, err)
+
+	// Invalid interval.
+	db = prepDB(t)
+
+	st, errCh, cancel, err = NewWithCleanup(db, _table, 0)
+	assert.Empty(t, st)
+	assert.Nil(t, errCh)
+	assert.Nil(t, cancel)
+	assert.Error(t, err)
+
+	// Success.
+	db = prepDB(t)
+
+	st, errCh, cancel, err = NewWithCleanup(db, _table, time.Second)
+	require.NoError(t, err)
+	assert.NotNil(t, errCh)
+	assert.NotNil(t, cancel)
+	assert.NotNil(t, st.deletion.fns)
+
+	cancel()
+
+	// Error channel is returning errors.
+	db = prepDB(t)
+
+	st, errCh, cancel, err = NewWithCleanup(db, _table, time.Millisecond*50)
+	require.NoError(t, err)
+	assert.NotNil(t, errCh)
+	assert.NotNil(t, cancel)
+	assert.NotNil(t, st.deletion.fns)
+	require.NoError(t, db.Close())
+	require.Error(t, <-errCh)
+
+	cancel()
+}
+
 func Test_SQLiteStore_Cleanup(t *testing.T) {
 	// Closed DB returns an error.
 	db := prepDB(t)
@@ -79,7 +124,7 @@ func Test_SQLiteStore_Cleanup(t *testing.T) {
 
 	st.db = prepDB(t)
 
-	// Empty db should not return an error.
+	// Empty sessions should not return an error.
 	assert.NoError(t, st.removeExpiredSessions(context.Background()))
 
 	// Invalid interval.
@@ -125,7 +170,7 @@ func Test_SQLiteStore_Cleanup(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		err := st.Cleanup(ctx, time.Hour)
+		err := st.Cleanup(ctx, 1)
 		assert.Equal(t, ctx.Err(), err)
 	}()
 
@@ -195,8 +240,18 @@ func Test_SQLiteStore_FetchByID(t *testing.T) {
 		table: _table,
 	}
 
-	// Not found.
+	// Closed database returns an error.
+	st.db.Close() // nolint: errcheck // error is meaningless.
+
 	session, ok, err := st.FetchByID(context.Background(), "123")
+	assert.Empty(t, session)
+	assert.False(t, ok)
+	assert.Error(t, err)
+
+	st.db = prepDB(t)
+
+	// Not found.
+	session, ok, err = st.FetchByID(context.Background(), "123")
 	assert.Empty(t, session)
 	assert.False(t, ok)
 	assert.NoError(t, err)
@@ -234,8 +289,17 @@ func Test_SQLiteStore_FetchByUserKey(t *testing.T) {
 		table: _table,
 	}
 
-	// Not found.
+	// Closed db returns an error.
+	st.db.Close() // nolint: errcheck // error is meaningless.
+
 	sessions, err := st.FetchByUserKey(context.Background(), "123")
+	assert.Empty(t, sessions)
+	assert.Error(t, err)
+
+	st.db = prepDB(t)
+
+	// Not found.
+	sessions, err = st.FetchByUserKey(context.Background(), "123")
 	assert.Empty(t, sessions)
 	assert.NoError(t, err)
 
@@ -278,6 +342,13 @@ func Test_SQLiteStore_DeleteByID(t *testing.T) {
 		table: _table,
 	}
 
+	// Closed db returns an error.
+	st.db.Close() // nolint: errcheck // error is meaningless.
+
+	assert.Error(t, st.DeleteByID(context.Background(), "123"))
+
+	st.db = prepDB(t)
+
 	// Not found.
 	assert.NoError(t, st.DeleteByID(context.Background(), "123"))
 
@@ -316,6 +387,13 @@ func Test_SQLiteStore_DeleteByUserKey(t *testing.T) {
 		db:    prepDB(t),
 		table: _table,
 	}
+
+	// Closed db returns an error.
+	st.db.Close() // nolint: errcheck // error is meaningless.
+
+	assert.Error(t, st.DeleteByUserKey(context.Background(), "123"))
+
+	st.db = prepDB(t)
 
 	// Not found.
 	assert.NoError(t, st.DeleteByUserKey(context.Background(), "123"))

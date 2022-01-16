@@ -64,3 +64,35 @@ go func() {
 cancel()
 wg.Wait()
 ```
+
+Cleanup can also be started when creating SQLiteStore using NewWithCleanup.
+Additionally it returns error channel and close/cancel delegate function.
+
+```go
+
+db, err := sql.Open("sqlite3", path)
+if err != nil {
+      // handle error
+}
+
+store, errCh, cancel, err := sqlitestore.NewWithCleanup(db, "sessions", 15 * time.Minute)
+if err != nil {
+      // handle error
+}
+
+var wg sync.WaitGroup
+wg.Add(1)
+go func() {
+	defer wg.Done()
+	for err := range errCh {
+		// log cleanup errors
+	}
+}()
+
+manager := sessionup.NewManager(store)
+
+// graceful application close
+cancel()
+wg.Wait() 
+
+```
