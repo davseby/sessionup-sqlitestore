@@ -155,13 +155,20 @@ func Test_SQLiteStore_Cleanup(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	var calls int
+	var (
+		calls int
+		mu    sync.Mutex
+	)
+
 	st.deletion.fns = map[uint64]func(context.Context, sessionup.Session){
 		0: func(_ context.Context, session sessionup.Session) {
 			assert.Equal(t, sessions[1], session)
 			close(ch)
 			cancel()
+
+			mu.Lock()
 			calls++
+			mu.Unlock()
 		},
 	}
 
@@ -177,7 +184,9 @@ func Test_SQLiteStore_Cleanup(t *testing.T) {
 	<-ch
 	wg.Wait()
 
+	mu.Lock()
 	assert.Equal(t, 1, calls)
+	mu.Unlock()
 }
 
 func Test_SQLiteStore_OnDeletion(t *testing.T) {
