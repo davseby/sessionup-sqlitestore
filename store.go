@@ -31,7 +31,7 @@ type SQLiteStore struct {
 		mu sync.Mutex
 
 		nextID uint64
-		fns    map[uint64]func(context.Context, sessionup.Session)
+		fns    map[uint64]func(sessionup.Session)
 	}
 }
 
@@ -57,7 +57,7 @@ func New(db *sql.DB, table string) (*SQLiteStore, error) {
 		table: table,
 	}
 
-	st.deletion.fns = make(map[uint64]func(context.Context, sessionup.Session))
+	st.deletion.fns = make(map[uint64]func(sessionup.Session))
 
 	return st, nil
 }
@@ -141,15 +141,36 @@ func (st *SQLiteStore) Cleanup(ctx context.Context, dur time.Duration) error {
 
 // OnDeletion sets provided handler to be executed whenever a session is deleted.
 // Unsubscribe method is returned, that allows to unset the handler.
-func (st *SQLiteStore) OnDeletion(fn func(context.Context, sessionup.Session)) func() {
+// If the returned unsubscribe method is invoked with true, then it will
+// block until the provided handler returns. Otherwise, it will
+// not block.
+func (st *SQLiteStore) OnDeletion(fn func(context.Context, sessionup.Session)) func(bool) {
 	st.deletion.mu.Lock()
 	defer st.deletion.mu.Unlock()
 
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var wg sync.WaitGroup
+
 	id := st.deletion.nextID
 	st.deletion.nextID++
-	st.deletion.fns[id] = fn
 
-	return func() {
+	st.deletion.fns[id] = func(s sessionup.Session) {
+		wg.Add(1)
+
+		go func() {
+			fn(ctx, s)
+			wg.Done()
+		}()
+	}
+
+	return func(wait bool) {
+		cancel()
+
+		if wait {
+			wg.Wait()
+		}
+
 		st.deletion.mu.Lock()
 		delete(st.deletion.fns, id)
 		st.deletion.mu.Unlock()
@@ -269,7 +290,7 @@ func (st *SQLiteStore) DeleteByID(ctx context.Context, id string) error {
 	}
 
 	for _, fn := range st.deletion.fns {
-		go fn(ctx, sessions[0])
+		fn(sessions[0])
 	}
 
 	return nil
@@ -318,7 +339,7 @@ func (st *SQLiteStore) DeleteByUserKey(ctx context.Context, key string, expIDs .
 
 	for _, session := range sessions {
 		for _, fn := range st.deletion.fns {
-			go fn(ctx, session)
+			fn(session)
 		}
 	}
 
@@ -430,7 +451,7 @@ func (st *SQLiteStore) removeExpiredSessions(ctx context.Context) error {
 
 	for _, session := range sessions {
 		for _, fn := range st.deletion.fns {
-			go fn(ctx, session)
+			fn(session)
 		}
 	}
 
