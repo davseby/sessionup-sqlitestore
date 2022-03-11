@@ -160,8 +160,8 @@ func Test_SQLiteStore_Cleanup(t *testing.T) {
 		mu    sync.Mutex
 	)
 
-	st.deletion.fns = map[uint64]func(context.Context, sessionup.Session){
-		0: func(_ context.Context, session sessionup.Session) {
+	st.deletion.fns = map[uint64]func(sessionup.Session){
+		0: func(session sessionup.Session) {
 			assert.Equal(t, sessions[1], session)
 			close(ch)
 			cancel()
@@ -191,19 +191,37 @@ func Test_SQLiteStore_Cleanup(t *testing.T) {
 
 func Test_SQLiteStore_OnDeletion(t *testing.T) {
 	st := &SQLiteStore{}
-	st.deletion.fns = make(map[uint64]func(context.Context, sessionup.Session))
+	st.deletion.fns = make(map[uint64]func(sessionup.Session))
 
+	blockCh := make(chan struct{})
+
+	defer close(blockCh)
+
+	// Don't wait for handler completion
 	var called bool
 	unsub := st.OnDeletion(func(_ context.Context, _ sessionup.Session) {
+		<-blockCh
 		called = true
 	})
 
 	assert.Len(t, st.deletion.fns, 1)
-	st.deletion.fns[0](context.Background(), sessionup.Session{})
+	st.deletion.fns[0](sessionup.Session{})
 
-	unsub()
+	unsub(false)
 	assert.Len(t, st.deletion.fns, 0)
+	assert.False(t, called)
 
+	// Wait for handler completion
+	unsub = st.OnDeletion(func(_ context.Context, _ sessionup.Session) {
+		called = true
+	})
+
+	assert.Len(t, st.deletion.fns, 1)
+	st.deletion.fns[1](sessionup.Session{})
+
+	unsub(true)
+
+	assert.Len(t, st.deletion.fns, 0)
 	assert.True(t, called)
 }
 
@@ -379,16 +397,21 @@ func Test_SQLiteStore_DeleteByID(t *testing.T) {
 		mustInsert(t, st.db, session)
 	}
 
-	ch := make(chan struct{})
-	st.deletion.fns = map[uint64]func(context.Context, sessionup.Session){
-		0: func(_ context.Context, session sessionup.Session) {
+	called := make([]bool, 2)
+	st.deletion.fns = map[uint64]func(sessionup.Session){
+		0: func(session sessionup.Session) {
 			assert.Equal(t, mocked[1], session)
-			close(ch)
+			called[0] = true
+		},
+		1: func(session sessionup.Session) {
+			assert.Equal(t, mocked[1], session)
+			called[1] = true
 		},
 	}
 
 	assert.NoError(t, st.DeleteByID(context.Background(), "2"))
-	<-ch
+	assert.True(t, called[0])
+	assert.True(t, called[1])
 }
 
 func Test_SQLiteStore_DeleteByUserKey(t *testing.T) {
@@ -440,17 +463,10 @@ func Test_SQLiteStore_DeleteByUserKey(t *testing.T) {
 		mustInsert(t, st.db, session)
 	}
 
-	var (
-		wg      sync.WaitGroup
-		mu      sync.Mutex
-		visited = make(map[string]struct{})
-	)
+	visited := make(map[string]struct{})
 
-	wg.Add(2)
-	st.deletion.fns = map[uint64]func(context.Context, sessionup.Session){
-		0: func(_ context.Context, session sessionup.Session) {
-			mu.Lock()
-			defer mu.Unlock()
+	st.deletion.fns = map[uint64]func(sessionup.Session){
+		0: func(session sessionup.Session) {
 
 			visited[session.ID] = struct{}{}
 			for _, expected := range mocked {
@@ -458,13 +474,10 @@ func Test_SQLiteStore_DeleteByUserKey(t *testing.T) {
 					assert.Equal(t, expected, session)
 				}
 			}
-
-			wg.Done()
 		},
 	}
 
 	assert.NoError(t, st.DeleteByUserKey(context.Background(), "124", "5"))
-	wg.Wait()
 
 	_, ok := visited["1"]
 	assert.True(t, ok)
